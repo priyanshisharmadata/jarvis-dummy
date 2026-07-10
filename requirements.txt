@@ -1,0 +1,31 @@
+# Jarvis — AI Voice Assistant for Windows
+# Install: pip install -r requirements.txt
+
+# Core framework
+eel>=0.16.0
+
+# Voice (speech-to-text + text-to-speech)
+SpeechRecognition>=3.10.0
+pyttsx3>=2.90
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Screen automation
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+
+# YouTube playback
+pywhatkit>=5.4
+
+# Audio (optional — fallback to playsound if unavailable)
+pygame>=2.5.0
+
+# Computer vision (contrib needed for face recognition)
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+
+# Chatbot
+hugchat>=0.3.0
+
+# Hot-word detection (optional)
+pvporcupine>=3.0.0
