@@ -29,3 +29,6 @@ hugchat>=0.3.0
 
 # Hot-word detection (optional)
 pvporcupine>=3.0.0
+
+# Windows offline speech recognition (optional — built-in SAPI engine)
+pywin32>=306

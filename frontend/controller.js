@@ -21,10 +21,16 @@ function DisplayMessage(message) {
 
 /**
  * Show the main "hood" / particle UI, hide the wave.
+ * Also releases the mic debounce lock so the user can trigger
+ * another voice command immediately.
  */
 function ShowHood() {
   $("#Oval").attr("hidden", false);
   $("#SiriWave").attr("hidden", true);
+  // Release mic debounce lock (set in main.js)
+  if (typeof _micBusy !== "undefined") {
+    _micBusy = false;
+  }
 }
 
 /**

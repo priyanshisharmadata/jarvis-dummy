@@ -683,10 +683,10 @@ def hotword() -> None:
 
             if keyword_index >= 0:
                 print("hotword detected")
-                pyautogui.keyDown("win")
-                pyautogui.press("j")
-                time.sleep(2)
-                pyautogui.keyUp("win")
+                # Use hotkey() instead of manual keyDown/press/sleep/keyUp.
+                # The old code held Win for 2 seconds, which flashed the
+                # Start menu and interfered with other shortcuts.
+                pyautogui.hotkey("win", "j")
 
     except Exception as exc:
         print(f"Hotword error: {exc}")
