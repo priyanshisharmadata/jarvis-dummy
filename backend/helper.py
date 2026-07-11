@@ -36,16 +36,44 @@ def extract_yt_term(command: str) -> str:
 
     # Pattern 3 – Hindi / Hinglish patterns the command parser already
     #            transliterated into English keywords.  We strip known
-    #            filler words and return whatever is left.
-    fillers = [
-        "play", "baja", "bajao", "chala", "chalao", "gaana", "gaane",
-        "song", "music", "youtube pe", "youtube par", "on youtube",
-        "video", "gaanaa", "गाना", "गाने", "बजाओ", "चलाओ",
+    #            COMMAND words (not content words like "song", "music").
+    #
+    #            Strategy: first remove multi-word command phrases, then
+    #            remove single-word command verbs.  Content nouns (song,
+    #            music, gaana) are NOT stripped because they could be
+    #            part of the actual search term.
+
+    # Phase 1 — multi-word command phrases (longest first)
+    command_phrases = [
+        "youtube pe", "youtube par", "on youtube",
+        "search karo", "play karo", "play kar",
+        "baja de", "baja do", "bajao na",
+        "chala de", "chala do", "chalao na",
+        "karo search", "search kar",
     ]
     term = command
-    for fw in fillers:
-        term = re.sub(rf"\b{re.escape(fw)}\b", "", term, flags=re.IGNORECASE)
-    term = term.strip()
+    for cp in command_phrases:
+        term = re.sub(re.escape(cp), "", term, flags=re.IGNORECASE)
+
+    # Phase 2 — single-word command verbs (only words that are clearly
+    #           commands, not content)
+    command_words = [
+        "play", "baja", "bajao", "bajana",
+        "chala", "chalao", "chalana",
+        "karo", "karna", "kar",
+        "sunao", "sunana", "dikhao",
+        "gaane", "gane",             # "gaane/gane" = songs (plural, filler)
+                                     # "gaana/gana" stays — it could be "Gaana.com" or a song name
+        "na",                        # Hindi filler: "baja de na", "chala do na"
+        "to",                        # "play to", "baja to"
+        "बजाओ", "चलाओ", "करो", "सुनाओ", "दिखाओ",
+        "गाने",
+    ]
+    for cw in command_words:
+        term = re.sub(rf"\b{re.escape(cw)}\b", "", term, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace
+    term = re.sub(r"\s+", " ", term).strip()
 
     return term if term else command
 

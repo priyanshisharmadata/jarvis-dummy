@@ -23,6 +23,13 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+# -- Reconfigure stdout for Unicode (fixes cp1252 crashes on Windows) --
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from backend.command import speak
 from backend.feature import play_assistant_sound
 
@@ -49,14 +56,25 @@ def _find_free_port(start: int = 8000, max_attempts: int = 20) -> int:
 
 
 def _open_browser(url: str, delay: float = 2.0) -> None:
-    """Open the given URL in a Microsoft Edge app window after a short delay."""
+    """Open the given URL in a Microsoft Edge app window after a short delay.
+
+    Falls back to the system default browser when Edge is not installed.
+    """
     time.sleep(delay)
-    # Prefer Edge in app mode; falls back to default browser if Edge not found
-    try:
-        os.system(f'start msedge.exe --app="{url}"')
-    except Exception:
-        import webbrowser
-        webbrowser.open(url)
+
+    # Try Edge in app-mode first (cleaner UI for assistant)
+    import shutil
+    edge_path = shutil.which("msedge") or shutil.which("msedge.exe")
+    if edge_path:
+        try:
+            os.system(f'start msedge.exe --app="{url}"')
+            return
+        except Exception:
+            pass
+
+    # Fall back to the system default browser
+    import webbrowser
+    webbrowser.open(url)
 
 
 def start() -> None:
@@ -70,13 +88,23 @@ def start() -> None:
 
     @eel.expose
     def init() -> None:
-        """Called by the front-end once it has finished loading."""
+        """Called by the front-end once it has finished loading.
+
+        Steps through the loading sequence with proper delays so each
+        animation has time to play before the next one appears.
+        """
         print("DEBUG: init() called from frontend")
-        eel.hideLoader()
-        eel.hideFaceAuth()
-        eel.hideFaceAuthSuccess()
-        eel.hideStart()
+        eel.hideLoader()          # Loader → FaceAuth
+        time.sleep(3.5)           # Let face-auth Lottie play
+        eel.hideFaceAuth()        # FaceAuth → Success checkmark
+        time.sleep(2.5)           # Let success animation play
+        eel.hideFaceAuthSuccess() # Success → Hello greeting
+        time.sleep(2.0)           # Let greeting animation play
+        eel.hideStart()           # Show main UI (Jarvis hood)
         print("DEBUG: All hide functions called")
+        # Greet the user now that the UI is ready
+        speak("Welcome to Your Assistant")
+        play_assistant_sound()
 
     @eel.expose
     def start_listening() -> None:

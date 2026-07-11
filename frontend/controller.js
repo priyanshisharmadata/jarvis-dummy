@@ -29,6 +29,8 @@ function ShowHood() {
 
 /**
  * Display the user's message in a chat-bubble style.
+ * Falls back to the scrolling message banner when the chat container
+ * isn't present in the DOM.
  * @param {string} message
  */
 function senderText(message) {
@@ -41,11 +43,16 @@ function senderText(message) {
         </div>
       </div>`;
     chatBox.scrollTop = chatBox.scrollHeight;
+  } else if (message && message.trim() !== "") {
+    // Fallback: show in the scrolling banner
+    DisplayMessage("You: " + message);
   }
 }
 
 /**
  * Display a received / assistant message in a chat-bubble style.
+ * Falls back to the scrolling message banner when the chat container
+ * isn't present in the DOM.
  * @param {string} message
  */
 function receiverText(message) {
@@ -58,6 +65,9 @@ function receiverText(message) {
         </div>
       </div>`;
     chatBox.scrollTop = chatBox.scrollHeight;
+  } else if (message && message.trim() !== "") {
+    // Fallback: show in the scrolling banner
+    DisplayMessage("Jarvis: " + message);
   }
 }
 

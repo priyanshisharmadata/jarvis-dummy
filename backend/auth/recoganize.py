@@ -15,9 +15,16 @@ Requires
 
 import os
 import time
+import traceback
 
 import cv2
 import pyautogui as p
+
+# LBPH confidence threshold.  Lower values = stricter matching.
+# 0   → perfect match (only in laboratory conditions)
+# 50  → good match (typical for well-lit, front-facing images)
+# 100 → loose match (tolerates pose / lighting variance)
+_CONFIDENCE_THRESHOLD = 100
 
 
 def AuthenticateFace() -> int:
@@ -47,12 +54,11 @@ def AuthenticateFace() -> int:
     faceCascade = cv2.CascadeClassifier(cascade_path)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # ID -> name mapping (index 1 = first trained person, etc.)
-    # The original used id=2 but that corresponds to the *second* person.
-    # We keep the list extensible so you can add more names.
-    names = ["", "Person 1", "Person 2", "Person 3", "Person 4", "Person 5"]
-
     cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cam.isOpened():
+        print("[AUTH] Cannot open webcam")
+        return 0
+
     cam.set(3, 640)   # width
     cam.set(4, 480)   # height
 
@@ -60,49 +66,64 @@ def AuthenticateFace() -> int:
     minH = int(0.1 * cam.get(4))
 
     flag = 0
+    win_name = "Face Authentication"
 
-    while True:
-        ret, img = cam.read()
-        if not ret:
-            print("[AUTH] Camera read failed")
-            break
+    try:
+        while True:
+            ret, img = cam.read()
+            if not ret:
+                print("[AUTH] Camera read failed")
+                break
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        faces = faceCascade.detectMultiScale(
-            gray,
-            scaleFactor=1.2,
-            minNeighbors=5,
-            minSize=(minW, minH),
-        )
+            faces = faceCascade.detectMultiScale(
+                gray,
+                scaleFactor=1.2,
+                minNeighbors=5,
+                minSize=(minW, minH),
+            )
 
-        for (x, y, w, h) in faces:
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            for (x, y, w, h) in faces:
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            person_id, accuracy = recognizer.predict(gray[y:y + h, x:x + w])
+                person_id, confidence = recognizer.predict(
+                    gray[y:y + h, x:x + w]
+                )
 
-            if accuracy < 100:
-                label = names[person_id] if person_id < len(names) else str(person_id)
-                acc_text = f"  {round(100 - accuracy):.0f}%"
-                flag = 1
-            else:
-                label = "unknown"
-                acc_text = f"  {round(100 - accuracy):.0f}%"
-                flag = 0
+                if confidence < _CONFIDENCE_THRESHOLD:
+                    # Confidence is LOW → good match (LBPH returns distance)
+                    label = f"Person {person_id}"
+                    match_pct = round(100 - confidence)
+                    flag = 1
+                else:
+                    label = "unknown"
+                    match_pct = round(100 - min(confidence, 100))
+                    flag = 0
 
-            cv2.putText(img, str(label), (x + 5, y - 5), font, 1,
-                        (255, 255, 255), 2)
-            cv2.putText(img, str(acc_text), (x + 5, y + h - 5), font, 1,
-                        (255, 255, 0), 1)
+                cv2.putText(img, str(label), (x + 5, y - 5), font, 1,
+                            (255, 255, 255), 2)
+                cv2.putText(img, f"  {match_pct}%", (x + 5, y + h - 5),
+                            font, 1, (255, 255, 0), 1)
 
-        cv2.imshow("Face Authentication", img)
+            cv2.imshow(win_name, img)
 
-        key = cv2.waitKey(10) & 0xFF
-        if key == 27:   # ESC
-            break
-        if flag == 1:
-            break
+            key = cv2.waitKey(10) & 0xFF
+            if key == 27:   # ESC
+                break
+            if flag == 1:
+                time.sleep(1.5)  # let the user see the match
+                break
 
-    cam.release()
-    cv2.destroyAllWindows()
+    except Exception as exc:
+        print(f"[AUTH] Error: {exc}")
+        traceback.print_exc()
+    finally:
+        cam.release()
+        # Destroy only our own window, not every OpenCV window on the system
+        try:
+            cv2.destroyWindow(win_name)
+        except Exception:
+            pass
+
     return flag

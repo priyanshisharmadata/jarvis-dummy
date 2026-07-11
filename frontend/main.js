@@ -84,8 +84,8 @@ $(document).ready(function () {
         console.log(e);
       }
       $("#chatbox").val("");
-      $("#MicBtn").attr("hidden", false);
-      $("#SendBtn").attr("hidden", true);
+      // Trigger input event manually so the Mic/Send button state resets
+      $("#chatbox").trigger("input");
     }
   }
 
@@ -100,6 +100,12 @@ $(document).ready(function () {
       $("#SendBtn").attr("hidden", true);
     }
   });
+
+  // Helper: reset the chatbox buttons to mic mode
+  function resetButtons() {
+    $("#MicBtn").attr("hidden", false);
+    $("#SendBtn").attr("hidden", true);
+  }
 
   // -- Send button --
   $("#SendBtn").click(function () {
@@ -118,6 +124,26 @@ $(document).ready(function () {
   // -----------------------------------------------------------------------
   $("#ChatBtn").click(function () {
     ShowHood();
+  });
+
+  // -----------------------------------------------------------------------
+  // 7. Settings button — refresh app database
+  // -----------------------------------------------------------------------
+  $("#SettingBtn").click(function () {
+    try {
+      eel.play_assistant_sound()();
+    } catch (e) {
+      /* sound is optional */
+    }
+    // Show the listening wave as feedback
+    $("#Oval").attr("hidden", true);
+    $("#SiriWave").attr("hidden", false);
+    // Tell user settings are accessible via config.py
+    try {
+      eel.takeAllCommands("settings")();
+    } catch (e) {
+      console.log("Settings error:", e);
+    }
   });
 
   console.log("Jarvis ready! Mic button = voice (Python), Chat box = type");

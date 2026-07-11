@@ -19,6 +19,9 @@ jarvis.db
 Thumbs.db
 Desktop.ini
 
+# Claude Code local settings (contains API keys)
+.claude/
+
 # Chatbot auth cookie
 backend/cookie.json
 
