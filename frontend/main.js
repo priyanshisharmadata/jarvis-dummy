@@ -43,8 +43,18 @@ $(document).ready(function () {
 
   // -----------------------------------------------------------------------
   // 3. Mic button — start voice recognition via Python
+  //    (debounced: ignores clicks within 2s to prevent double-trigger)
   // -----------------------------------------------------------------------
-  $("#MicBtn").click(function () {
+  var _micBusy = false;
+  var _micDebounceTimer = null;
+
+  function _startListening() {
+    if (_micBusy) {
+      console.log("Mic busy — ignoring duplicate trigger");
+      return;
+    }
+    _micBusy = true;
+
     try {
       eel.play_assistant_sound()();
     } catch (e) {
@@ -53,21 +63,23 @@ $(document).ready(function () {
     $("#Oval").attr("hidden", true);
     $("#SiriWave").attr("hidden", false);
     eel.takeAllCommands()();
-  });
+
+    // Release the lock after a reasonable timeout (Python calls
+    // ShowHood() when done, which restores Oval + hides SiriWave)
+    clearTimeout(_micDebounceTimer);
+    _micDebounceTimer = setTimeout(function () {
+      _micBusy = false;
+    }, 15000); // 15s — longer than any single voice-command cycle
+  }
+
+  $("#MicBtn").click(_startListening);
 
   // -----------------------------------------------------------------------
   // 4. Keyboard shortcut  (Ctrl+J  or  Win+J)
   // -----------------------------------------------------------------------
   $(document).keydown(function (e) {
     if ((e.key === "j" || e.key === "J") && (e.metaKey || e.ctrlKey)) {
-      try {
-        eel.play_assistant_sound()();
-      } catch (err) {
-        /* sound is optional */
-      }
-      $("#Oval").attr("hidden", true);
-      $("#SiriWave").attr("hidden", false);
-      eel.takeAllCommands()();
+      _startListening();
     }
   });
 
@@ -127,7 +139,7 @@ $(document).ready(function () {
   });
 
   // -----------------------------------------------------------------------
-  // 7. Settings button — refresh app database
+  // 7. Settings button — opens config.py location
   // -----------------------------------------------------------------------
   $("#SettingBtn").click(function () {
     try {
@@ -135,12 +147,12 @@ $(document).ready(function () {
     } catch (e) {
       /* sound is optional */
     }
-    // Show the listening wave as feedback
+    // Show brief feedback
     $("#Oval").attr("hidden", true);
     $("#SiriWave").attr("hidden", false);
-    // Tell user settings are accessible via config.py
     try {
-      eel.takeAllCommands("settings")();
+      // Refresh app database and show settings info
+      eel.takeAllCommands("open settings")();
     } catch (e) {
       console.log("Settings error:", e);
     }

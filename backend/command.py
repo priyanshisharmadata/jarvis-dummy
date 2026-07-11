@@ -25,6 +25,15 @@ import speech_recognition as sr
 
 from backend import config
 
+# ---------------------------------------------------------------------------
+#  Speech-recognition retry configuration
+# ---------------------------------------------------------------------------
+# Number of times to retry the Google Speech API on transient errors
+# (network glitches, 500s) before giving up.
+_MAX_API_RETRIES = 2
+# Seconds to wait between retries (doubles each retry: 1, 2, 4, …).
+_API_RETRY_BASE_DELAY = 1.0
+
 # Reconfigure stdout to handle Unicode (Devanagari) characters on Windows
 # terminals that default to cp1252.  Without this, ``print()`` calls with
 # Hindi text crash with ``UnicodeEncodeError``.
@@ -141,56 +150,193 @@ def speak(text: str, lang: str = "en") -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Speech-to-text  (multi-language)
+#  Speech-to-text  (multi-engine, multi-language)
+# ---------------------------------------------------------------------------
+#
+#  Engine cascade (tried in order until one succeeds):
+#    1. Google Speech Recognition  — shared key, works without any API key
+#    2. Google show_all alternates — picks best from multiple hypotheses
+#    3. PocketSphinx              — offline, always available when installed
+#    4. Windows SAPI              — offline, built into Windows 10/11
 # ---------------------------------------------------------------------------
 
+import tempfile as _tempfile
+import os as _os
+
 # Language models to try for Google Speech Recognition (in priority order).
-#
-# ``en-IN`` is tried FIRST because it handles Indian-accented English as well as
-# Hinglish (Hindi+English code-switching) — the most common input for this app.
-# ``en-US`` is the fallback for Western-accented English.
-# ``hi-IN`` is the LAST resort for pure-Hindi input — it was formerly first but
-# would often return garbled Devanagari for English/Hinglish speech instead of
-# raising ``UnknownValueError``, so the English fallbacks were never reached.
 _LANG_ATTEMPTS = [
     ("en-IN", "EN-IN"),
-    ("en-US", "EN-US"),
     ("hi-IN", "HI"),
+    ("en-US", "EN-US"),
+    (None,    "AUTO"),   # let Google detect language automatically
 ]
+
+# Words Google sometimes returns as "filler" when it can't understand speech.
+# These are never valid Jarvis commands, so we reject them as gibberish.
+_GIBBERISH = {
+    "the", "a", "an", "oh", "uh", "um", "ah", "hmm", "mm",
+    "i", "you", "we", "it", "he", "she", "they",
+    "and", "but", "or", "so", "if", "in", "on", "at", "to", "of",
+    "is", "am", "are", "was", "were", "be", "been",
+    "yes", "no", "ok", "okay", "yeah", "hey", "hi", "hello",
+    "thanks", "thank you", "please",
+    "what", "when", "where", "who", "why", "how",
+    "this", "that", "these", "those", "there", "here",
+    "just", "like", "well", "right", "now", "then",
+}
+
+
+def _is_gibberish(text: str) -> bool:
+    """Return True if *text* looks like a recognition error."""
+    t = text.strip().lower()
+    if len(t) <= 1:
+        return True
+    if t in _GIBBERISH:
+        return True
+    if len(t) <= 2 and t.isalpha():
+        return True
+    return False
+
+
+def _extract_best(response) -> str | None:
+    """Pick the longest non-gibberish transcript from a Google response."""
+    if not response:
+        return None
+    candidates: list[str] = []
+
+    if isinstance(response, dict):
+        for alt in response.get("alternative", []):
+            t = (alt.get("transcript", "") if isinstance(alt, dict) else str(alt)).strip()
+            if t:
+                candidates.append(t)
+    elif isinstance(response, list):
+        for item in response:
+            t = (item.get("transcript", "") if isinstance(item, dict) else str(item)).strip()
+            if t:
+                candidates.append(t)
+    elif isinstance(response, str):
+        candidates.append(response.strip())
+
+    candidates.sort(key=lambda t: len(t), reverse=True)
+    for c in candidates:
+        if not _is_gibberish(c):
+            return c
+    return candidates[0] if candidates else None
+
+
+def _transcribe_google(
+    recognizer: sr.Recognizer,
+    audio,
+    lang_code: str | None,
+    google_key: str | None,
+    tag: str,
+) -> tuple[str | None, bool]:
+    """Call Google Speech Recognition with retries + alternate hypotheses."""
+    for attempt in range(_MAX_API_RETRIES + 1):
+        try:
+            kwargs: dict = {"show_all": True}
+            if lang_code is not None:
+                kwargs["language"] = lang_code
+            if google_key:
+                kwargs["key"] = google_key
+
+            response = recognizer.recognize_google(audio, **kwargs)
+            best = _extract_best(response)
+
+            if best and not _is_gibberish(best):
+                print(f"[{tag}] User said: {best}")
+                return best, False
+            return None, False
+
+        except sr.UnknownValueError:
+            return None, False
+
+        except sr.RequestError as exc:
+            err = str(exc)
+            print(f"[{tag}] Google API error (attempt {attempt + 1}): {err}")
+            if "404" in err.lower():
+                return None, True
+            if attempt < _MAX_API_RETRIES:
+                delay = _API_RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"[{tag}] Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                return None, True
+
+    return None, True
+
+
+def _recognize_sphinx(recognizer, audio) -> str | None:
+    """Offline PocketSphinx — no API key needed."""
+    try:
+        r = recognizer.recognize_sphinx(audio)
+        if r and r.strip() and not _is_gibberish(r.strip()):
+            return r.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _recognize_sapi(audio_data) -> str | None:
+    """Windows built-in offline speech recognition — no API key needed.
+
+    Uses the Windows Desktop Speech Recognition engine (SAPI) that ships
+    with Windows 10/11.  Completely offline, no internet required.
+    """
+    try:
+        import pythoncom
+        import win32com.client as _win32
+        import io as _io
+
+        pythoncom.CoInitialize()
+        try:
+            # Write audio to an in-memory WAV stream
+            wav_buf = _io.BytesIO(audio_data.get_wav_data())
+            wav_buf.seek(0)
+
+            # Create SAPI file stream from the WAV data
+            stream = _win32.Dispatch("SAPI.SpFileStream")
+            stream.Open(wav_buf, _win32.constants.SPFileMode_ReadOnly)
+
+            engine = _win32.Dispatch("SAPI.SpInprocRecognizer")
+            engine.AudioInputStream = stream
+
+            result = engine.Recognize()
+            if result:
+                text = result.PhraseInfo.GetText()
+                if text and text.strip() and not _is_gibberish(text.strip()):
+                    return text.strip()
+        finally:
+            pythoncom.CoUninitialize()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return None
 
 
 def takecommand(lang: str = "auto") -> str | None:
     """Listen to the microphone and return the recognised utterance.
 
-    Attempts Google Speech Recognition across Hindi, Indian English, and US
-    English models.  If Google's API is unreachable it falls back to offline
-    PocketSphinx (when installed).
-
-    Parameters
-    ----------
-    lang : str
-        Ignored (kept for backward compatibility).  All three models are
-        always tried in priority order.
+    Multi-engine cascade (no API key required):
+      1. Google Speech Recognition (shared key, with retries)
+      2. Google alternate hypotheses (picks best from multiple results)
+      3. PocketSphinx (offline)
+      4. Windows SAPI    (offline, built into Windows)
 
     Returns
     -------
     str or None
-        Lower-cased text, or ``None`` if recognition failed entirely.
+        Lower-cased text, or ``None`` if all engines failed.
     """
     recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 1
+    recognizer.pause_threshold = 1.2  # longer for Hindi/Hinglish pauses
 
-    # -- Suppress media players that interfere with the microphone ----------
-    # MX Player (and some other media apps) register as audio-device handlers
-    # and pop open whenever the microphone stream starts/stops.  Silently
-    # close them before listening so they don't steal focus from Jarvis.
     _suppress_interfering_apps()
 
-    # Set a sensible fallback energy threshold in case ``adjust_for_ambient_noise``
-    # fails silently.  The dynamic calibration below will normally overwrite this,
-    # but having a lower-than-default floor (300) avoids missing quiet speech on
-    # mics where auto-calibration doesn't work well.
-    recognizer.energy_threshold = 200
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.dynamic_energy_ratio = 1.3
 
     # -- Step 1: capture audio from the microphone --------------------------
     try:
@@ -198,14 +344,16 @@ def takecommand(lang: str = "auto") -> str | None:
             print("I'm listening... (सुन रहा हूं...)")
             eel.DisplayMessage("I'm listening... / सुन रहा हूं...")
 
-            # Calibrate for background noise.  A full second gives much
-            # better results than the common 0.5 s snippet.
-            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            try:
+                recognizer.adjust_for_ambient_noise(source, duration=1.5)
+                if recognizer.energy_threshold < 150:
+                    recognizer.energy_threshold = 150
+                print(f"Energy threshold: {recognizer.energy_threshold}")
+            except Exception as exc:
+                print(f"Ambient calibration failed: {exc}")
+                recognizer.energy_threshold = 300
 
-            # ``timeout``  = max seconds to wait for the user to START speaking.
-            # ``phrase_time_limit`` = max seconds of audio to capture once speech
-            #   begins (raised from 5 → 10 for longer Hindi / Hinglish commands).
-            audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+            audio = recognizer.listen(source, timeout=10, phrase_time_limit=12)
 
     except sr.WaitTimeoutError:
         print("No speech detected within 10 seconds")
@@ -220,88 +368,117 @@ def takecommand(lang: str = "auto") -> str | None:
             pass
         return None
 
-    # -- Step 2: transcribe the captured audio ------------------------------
+    # -- Reject audio that's obviously just noise ---------------------------
+    try:
+        import numpy as _np
+        raw = audio.get_raw_data()
+        samples = _np.frombuffer(raw, dtype=_np.int16)
+        rms = _np.sqrt(_np.mean(samples.astype(_np.float64) ** 2))
+        print(f"Audio RMS: {rms:.1f}")
+        if rms < 30:
+            print("Audio too quiet — rejecting as noise")
+            eel.DisplayMessage("Too quiet — please speak louder.")
+            return None
+    except Exception:
+        pass
+
+    # -- Step 2: transcribe — Google (all language models) ------------------
     print("Recognizing...")
     eel.DisplayMessage("Recognizing...")
 
     query: str | None = None
     api_unreachable = False
 
-    # Resolve the Google API key (if the user configured one)
     google_key = (
         config.GOOGLE_SPEECH_API_KEY.strip()
         if config.GOOGLE_SPEECH_API_KEY and config.GOOGLE_SPEECH_API_KEY.strip()
         else None
     )
 
+    if not google_key:
+        print("No custom API key — using shared Google key (retries built-in)")
+
     for lang_code, tag in _LANG_ATTEMPTS:
-        try:
-            kwargs: dict = {"language": lang_code}
-            if google_key:
-                kwargs["key"] = google_key
-
-            result = recognizer.recognize_google(audio, **kwargs)
-
-            # Guard against empty / whitespace-only results
-            if result and result.strip():
-                query = result.strip()
-                print(f"[{tag}] User said: {query}")
-                break  # success — don't try other languages
-            # Empty string — treat as failure, try next language
-            query = None
-
-        except sr.UnknownValueError:
-            # Speech audio was captured but Google couldn't make sense of it
-            # in this language.  Perfectly normal — just try the next model.
-            continue
-
-        except sr.RequestError as exc:
-            # Google's API returned an error (rate-limit, bad key, no internet…).
-            # Don't waste time trying the remaining languages — they all use the
-            # same API endpoint and will fail the same way.
+        result, is_api_error = _transcribe_google(
+            recognizer, audio, lang_code, google_key, tag
+        )
+        if is_api_error:
             api_unreachable = True
-            print(f"[{tag}] Google Speech API error: {exc}")
+            break
+        if result:
+            query = result
             break
 
-    # -- Step 3: offline fallback (Sphinx) ----------------------------------
+    # -- Step 3: offline fallback #1 — PocketSphinx -------------------------
     if query is None and not api_unreachable:
-        # Google didn't understand the audio in any language — try Sphinx
-        # as a last resort (only if the user has pocketsphinx installed).
-        try:
-            query = recognizer.recognize_sphinx(audio)
-            if query and query.strip():
-                query = query.strip()
-                print(f"[SPHINX] User said: {query}")
-        except sr.UnknownValueError:
-            pass
-        except sr.RequestError:
-            pass
-        except Exception:
-            # pocketsphinx probably not installed — that's fine
-            pass
+        print("Trying offline Sphinx...")
+        sphinx_result = _recognize_sphinx(recognizer, audio)
+        if sphinx_result:
+            print(f"[SPHINX] User said: {sphinx_result}")
+            query = sphinx_result
 
-    # -- Step 4: report back to the user ------------------------------------
+    # -- Step 4: offline fallback #2 — Windows SAPI -------------------------
+    if query is None and not api_unreachable:
+        print("Trying Windows offline SAPI...")
+        sapi_result = _recognize_sapi(audio)
+        if sapi_result:
+            print(f"[SAPI] User said: {sapi_result}")
+            query = sapi_result
+
+    # -- Step 5: report back -------------------------------------------------
     if query is None:
         if api_unreachable:
-            speak(
-                "Speech recognition service is unavailable. "
-                "Please check your internet connection, or add a Google API "
-                "key in backend/config.py to avoid rate limits."
+            _say(
+                "Speech recognition is unavailable. Check internet or type your command.",
+                "Speech recognition abhi kaam nahi kar raha. Internet check karo ya type karo.",
             )
         else:
-            speak("Sorry, main samjha nahi. Dobara bolo.", "hi")
+            _say(
+                "Sorry, didn't understand. Try again or type your command.",
+                "Sorry, main samjha nahi. Dobara bolo ya type karo.",
+            )
+        # Save debug audio so the user can check what the mic captured
+        try:
+            _tmp = _tempfile.NamedTemporaryFile(
+                suffix=".wav", delete=False, prefix="jarvis_debug_"
+            )
+            _tmp.write(audio.get_wav_data())
+            _tmp.close()
+            print(f"Debug audio saved: {_tmp.name}")
+        except Exception:
+            pass
         return None
 
     eel.DisplayMessage(query)
 
-    # Echo the recognised text back to the user
     try:
-        has_hindi_chars = any(ord(c) > 127 for c in query)
-        speak(query, "hi" if has_hindi_chars else "en")
+        has_hindi = any(ord(c) > 127 for c in query)
+        speak(query, "hi" if has_hindi else "en")
     except Exception:
         pass
 
     return query.lower()
+
+
+# ---------------------------------------------------------------------------
+#  Keyword matching helper
+# ---------------------------------------------------------------------------
+
+def _match_keyword(query: str, keyword: str) -> bool:
+    """Match *keyword* in *query* using word boundaries for single words.
+
+    Multi-word keywords (like ``"on youtube"``) still use substring matching
+    because they are specific enough not to cause false positives.  Single
+    words like ``"play"``, ``"search"``, ``"open"``, ``"time"`` use
+    ``\\bword\\b`` to avoid matching inside longer words (e.g. "research"
+    matching "search", or "display" matching "play").
+    """
+    if " " in keyword:
+        # Multi-word — specific enough for substring matching
+        return keyword in query
+    # Single word — use word boundaries to avoid false positives
+    import re as _re
+    return bool(_re.search(rf"\b{_re.escape(keyword)}\b", query))
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +636,7 @@ def takeAllCommands(message: str | None = None) -> None:
             "search for", "dhundho", "ढूंढो", "khojo", "खोजो",
             "internet par", "online search",
         ]
-        if any(kw in query for kw in search_keywords):
+        if any(_match_keyword(query, kw) for kw in search_keywords):
             from backend.feature import searchWeb
             searchWeb(query)
             eel.ShowHood()
@@ -472,7 +649,7 @@ def takeAllCommands(message: str | None = None) -> None:
             "channel", "चैनल", "youtuber", "यूट्यूबर",
             "youtube channel", "ka channel", "ki channel",
         ]
-        if any(kw in query for kw in channel_keywords):
+        if any(_match_keyword(query, kw) for kw in channel_keywords):
             from backend.feature import openYoutuber
             openYoutuber(query)
             eel.ShowHood()
@@ -485,7 +662,7 @@ def takeAllCommands(message: str | None = None) -> None:
             "open", "kholo", "खोलो", "khol", "खोल",
             "chalu karo", "start",
         ]
-        if any(kw in query for kw in open_keywords):
+        if any(_match_keyword(query, kw) for kw in open_keywords):
             from backend.feature import openCommand
             openCommand(query)
             eel.ShowHood()
@@ -499,7 +676,7 @@ def takeAllCommands(message: str | None = None) -> None:
             "gaana", "गाना", "youtube pe", "youtube par",
             "song", "music", "गाने",
         ]
-        if any(kw in query for kw in play_keywords):
+        if any(_match_keyword(query, kw) for kw in play_keywords):
             from backend.feature import PlayYoutube
             PlayYoutube(query)
             eel.ShowHood()
@@ -512,7 +689,7 @@ def takeAllCommands(message: str | None = None) -> None:
             "send message", "message bhejo", "मैसेज", "message karo",
             "whatsapp", "call", "कॉल", "video call", "video कॉल",
         ]
-        if any(kw in query for kw in msg_keywords):
+        if any(_match_keyword(query, kw) for kw in msg_keywords):
             from backend.feature import findContact, whatsApp, openCommand
 
             # If the user JUST said "whatsapp" (no call/message/video),
@@ -533,8 +710,11 @@ def takeAllCommands(message: str | None = None) -> None:
                 if any(w in query for w in ("send message", "message", "मैसेज")):
                     flag = "message"
                     if message is None:
-                        # Voice mode — ask user to speak the message body
+                        # Voice mode — ask user to speak the message body.
+                        # Brief sleep lets TTS release the audio device so
+                        # the next mic open doesn't conflict on Windows.
                         speak("Kya message bhejna hai? / What message to send?")
+                        time.sleep(0.5)
                         msg_text = takecommand()
                         if not msg_text:
                             speak("Message cancelled — no speech detected.")

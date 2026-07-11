@@ -138,6 +138,10 @@ class PyAudio:
             )
             device = None
 
+        # Prune dead streams from the list so it doesn't grow without bound
+        # across many voice-command cycles.
+        self._streams = [s for s in self._streams if not s.is_stopped()]
+
         stream = sd.InputStream(
             samplerate=samplerate,
             channels=ch,
@@ -152,10 +156,10 @@ class PyAudio:
     # ---------- Cleanup -------------------------------------------------
 
     def terminate(self) -> None:
-        """Stop and discard all streams created by this PyAudio instance."""
+        """Stop, close, and discard all streams created by this PyAudio instance."""
         for s in self._streams:
             try:
-                s.stop()
+                s.close()
             except Exception:
                 pass
         self._streams.clear()
@@ -183,13 +187,27 @@ class Stream:
         Returns
         -------
         bytes
-            Raw PCM audio bytes.
+            Raw PCM audio bytes.  Returns silence if the stream has stopped
+            or the device is unavailable.
         """
+        if self._stopped:
+            sample_size = get_sample_size(self._format)
+            return b"\x00" * (num_frames * sample_size)
+
         try:
             data, _ = self._stream.read(num_frames)
             return data.tobytes()
         except sd.CallbackStop:
-            # Return silence instead of crashing
+            self._stopped = True
+            sample_size = get_sample_size(self._format)
+            return b"\x00" * (num_frames * sample_size)
+        except sd.CallbackAbort:
+            self._stopped = True
+            sample_size = get_sample_size(self._format)
+            return b"\x00" * (num_frames * sample_size)
+        except Exception:
+            # PortAudioError, OSError, etc. — device likely unplugged.
+            self._stopped = True
             sample_size = get_sample_size(self._format)
             return b"\x00" * (num_frames * sample_size)
 
