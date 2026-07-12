@@ -349,6 +349,45 @@ def _find_app_in_system(app_name: str) -> str | None:
         except Exception:
             pass
 
+    # -- PATH lookup via `where` command (fast, catches any PATH-registered app)
+    if best_match is None:
+        try:
+            result = subprocess.run(
+                ["where", app_name],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # `where` returns all matches; pick the first .exe
+                lines = result.stdout.strip().splitlines()
+                for line in lines:
+                    if line.lower().endswith(".exe"):
+                        return line.strip()
+                return lines[0].strip()
+        except Exception:
+            pass
+
+    # -- UWP app search via PowerShell (catches Store apps not in builtin dict)
+    if best_match is None:
+        try:
+            ps_cmd = (
+                f'Get-AppxPackage | Where-Object {{ $_.Name -like "*{app_name}*" }} '
+                f'| ForEach-Object {{ $_.PackageFamilyName }} | Select-Object -First 3'
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=8,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pkg_name = result.stdout.strip().splitlines()[0].strip()
+                if pkg_name:
+                    # Convert to shell: URI — the PackageFamilyName is the
+                    # part after the publisher ID that explorer.exe needs.
+                    # We also try the common !App entry point.
+                    uwp_uri = f"shell:appsFolder\\{pkg_name}!App"
+                    return uwp_uri
+        except Exception:
+            pass
+
     return best_match
 
 
@@ -414,8 +453,7 @@ def openCommand(query: str) -> None:
             if _try_open(path):
                 _say(f"Opening {app_name}", f"{app_name} khol raha hoon")
                 return
-            # Builtin failed (e.g., whatsapp.exe not installed) — check
-            # for a web fallback before scanning the filesystem.
+            # Builtin failed — check for a web fallback
             print(f"[BUILTIN] Failed, checking web fallback...")
             if lookup in _APP_WEB_FALLBACK:
                 url = _APP_WEB_FALLBACK[lookup]
@@ -423,7 +461,23 @@ def openCommand(query: str) -> None:
                 _say(f"Opening {app_name} online", f"{app_name} online khol raha hoon")
                 webbrowser.open(url)
                 return
-            # No web fallback — fall through to DB / filesystem search
+
+        # -- Step 0b: Fuzzy match against builtin keys -------------------
+        # Catches minor STT errors like "calculate" → "calculator"
+        if lookup not in _BUILTIN_APPS:
+            for key in _BUILTIN_APPS:
+                if key in lookup or lookup in key:
+                    path = _BUILTIN_APPS[key]
+                    print(f"[BUILTIN-FUZZY] {lookup} → {key}: {path}")
+                    if _try_open(path):
+                        _say(f"Opening {key}", f"{key} khol raha hoon")
+                        return
+                    if key in _APP_WEB_FALLBACK:
+                        url = _APP_WEB_FALLBACK[key]
+                        print(f"[WEB-FALLBACK] Opening: {url}")
+                        _say(f"Opening {key} online", f"{key} online khol raha hoon")
+                        webbrowser.open(url)
+                        return
 
         # -- Step 1: DB exact match (apps) --------------------------------
         cursor.execute(
@@ -549,9 +603,15 @@ def _launch_path(path: str) -> bool:
     """
     try:
         if "shell:" in path.lower():
-            # UWP app / shell: protocol
-            result = os.system(f'start "" {path}')
-            return result == 0
+            # UWP app via shell: protocol — use explorer.exe directly
+            # (much more reliable than `start ""` which can misinterpret
+            # backslashes and special characters like ! in AppUserModelIds)
+            subprocess.run(
+                ["explorer.exe", path],
+                capture_output=True,
+                timeout=5,
+            )
+            return True
         else:
             # Check if the path exists first (exe, lnk, or URL)
             if path.startswith("http"):

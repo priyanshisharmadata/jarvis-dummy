@@ -77,6 +77,21 @@ def _open_browser(url: str, delay: float = 2.0) -> None:
     webbrowser.open(url)
 
 
+def _start_always_on() -> None:
+    """Launch the always-on continuous listening loop.
+
+    Runs in a daemon thread so it never blocks the Eel server.
+    When the app closes, the daemon thread is killed automatically.
+    """
+    time.sleep(1.0)  # Brief pause so TTS + sound finish playing
+    from backend.command import takeAllCommands
+    # Suppress media players one more time before starting
+    from backend.command import _suppress_interfering_apps
+    _suppress_interfering_apps()
+    # Enter the infinite listening loop — this never returns
+    takeAllCommands()
+
+
 def start() -> None:
     """Initialise the Eel front-end and launch the assistant server."""
     frontend_dir = os.path.join(ROOT_DIR, "frontend")
@@ -92,6 +107,9 @@ def start() -> None:
 
         Steps through the loading sequence with proper delays so each
         animation has time to play before the next one appears.
+        After the sequence completes, automatically starts always-on
+        continuous listening so Jarvis is ready for voice commands
+        without needing a mic-button press.
         """
         print("DEBUG: init() called from frontend")
         eel.hideLoader()          # Loader → FaceAuth
@@ -105,6 +123,11 @@ def start() -> None:
         # Greet the user now that the UI is ready
         speak("Welcome to Your Assistant")
         play_assistant_sound()
+
+        # Auto-start always-on continuous listening in a background thread.
+        # This runs takeAllCommands() which never returns — Jarvis stays
+        # in listening mode forever, ready for voice commands.
+        threading.Thread(target=_start_always_on, daemon=True).start()
 
     @eel.expose
     def start_listening() -> None:

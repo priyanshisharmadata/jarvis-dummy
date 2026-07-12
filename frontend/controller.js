@@ -27,10 +27,8 @@ function DisplayMessage(message) {
 function ShowHood() {
   $("#Oval").attr("hidden", false);
   $("#SiriWave").attr("hidden", true);
-  // Release mic debounce lock (set in main.js)
-  if (typeof _micBusy !== "undefined") {
-    _micBusy = false;
-  }
+  // Release mic debounce lock (set in main.js via window._micBusy)
+  window._micBusy = false;
 }
 
 /**

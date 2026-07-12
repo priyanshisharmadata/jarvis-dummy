@@ -30,9 +30,9 @@ from backend import config
 # ---------------------------------------------------------------------------
 # Number of times to retry the Google Speech API on transient errors
 # (network glitches, 500s) before giving up.
-_MAX_API_RETRIES = 2
+_MAX_API_RETRIES = 1
 # Seconds to wait between retries (doubles each retry: 1, 2, 4, …).
-_API_RETRY_BASE_DELAY = 1.0
+_API_RETRY_BASE_DELAY = 0.8
 
 # Reconfigure stdout to handle Unicode (Devanagari) characters on Windows
 # terminals that default to cp1252.  Without this, ``print()`` calls with
@@ -56,33 +56,62 @@ _tts_lock = None  # lazily-created threading.Lock in speak()
 # dispatching to feature functions so they can respond in Hindi/English.
 _last_query_hindi = False
 
+# Cached energy threshold — avoids re-calibrating on retry.
+_cached_energy_threshold: float | None = None
+
+# Tracks whether we've already suppressed media players in this session.
+_suppress_done = False
+
 
 def _suppress_interfering_apps() -> None:
-    """Silently close media players that intercept microphone events.
+    """Fast, non-blocking media-player suppression.
 
-    MX Player and a few other media apps register as audio-device handlers
-    on Windows.  When any app opens or closes a microphone stream (which
-    Jarvis does on every voice command), these media players pop open a
-    window, stealing focus.  We close them pre-emptively here.
+    Phase 1 (sync): ``taskkill /f`` — blocks for ~0.3s.
+    Phase 2 (bg thread): PowerShell minimize — runs in background so it
+    never delays the mic setup.
     """
     import subprocess as _sp
+    import threading as _th
     _interfering = [
-        "MXPlayer.exe",
         "MXPlayer.exe",
         "PotPlayerMini64.exe",
         "PotPlayerMini.exe",
         "GOM.EXE",
         "GOM64.EXE",
+        "VLC.exe",
+        "wmplayer.exe",
     ]
-    for proc in _interfering:
+    # Phase 1: force-kill (fast, synchronous — must finish before mic opens)
+    try:
+        _sp.run(
+            ["taskkill", "/f", "/im"] + _interfering,
+            capture_output=True,
+            timeout=1.0,
+        )
+    except Exception:
+        pass
+
+    # Phase 2: minimize survivors in background (PowerShell startup is slow)
+    def _minimize_bg() -> None:
         try:
+            ps_script = (
+                "Get-Process -Name "
+                + ",".join(p.replace(".exe", "") for p in _interfering)
+                + " -ErrorAction SilentlyContinue | ForEach-Object { "
+                "$_.MainWindowHandle } | ForEach-Object { "
+                "Add-Type -Name Win32 -Namespace API -MemberDefinition '"
+                "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);"
+                "'; [API.Win32]::ShowWindow($_, 6) }"
+            )
             _sp.run(
-                ["taskkill", "/f", "/im", proc],
+                ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True,
-                timeout=3,
+                timeout=5.0,
             )
         except Exception:
-            pass  # Not running — that's fine
+            pass
+
+    _th.Thread(target=_minimize_bg, daemon=True).start()
 
 
 def _say(en: str, hi: str) -> None:
@@ -164,10 +193,11 @@ import tempfile as _tempfile
 import os as _os
 
 # Language models to try for Google Speech Recognition (in priority order).
+# Reduced to 3 — en-IN handles Indian English + Hinglish well enough
+# that en-US is redundant; AUTO catches anything else.
 _LANG_ATTEMPTS = [
     ("en-IN", "EN-IN"),
     ("hi-IN", "HI"),
-    ("en-US", "EN-US"),
     (None,    "AUTO"),   # let Google detect language automatically
 ]
 
@@ -330,13 +360,25 @@ def takecommand(lang: str = "auto") -> str | None:
         Lower-cased text, or ``None`` if all engines failed.
     """
     recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 1.2  # longer for Hindi/Hinglish pauses
+    recognizer.pause_threshold = 1.2   # longer for Hindi/Hinglish pauses
+    recognizer.phrase_threshold = 0.2  # detect even short/quiet phrases
+    recognizer.non_speaking_duration = 0.3  # minimal silence padding
 
-    _suppress_interfering_apps()
+    # Suppress media players once per session — skip on retries
+    global _suppress_done
+    if not _suppress_done:
+        _suppress_interfering_apps()
+        _suppress_done = True
 
-    recognizer.energy_threshold = 300
     recognizer.dynamic_energy_threshold = True
-    recognizer.dynamic_energy_ratio = 1.3
+    recognizer.dynamic_energy_ratio = 1.15   # more sensitive (was 1.3)
+
+    # Use cached threshold if available (skips calibration on retry)
+    global _cached_energy_threshold
+    if _cached_energy_threshold is not None:
+        recognizer.energy_threshold = _cached_energy_threshold
+    else:
+        recognizer.energy_threshold = 200  # lower initial threshold (was 300)
 
     # -- Step 1: capture audio from the microphone --------------------------
     try:
@@ -345,18 +387,24 @@ def takecommand(lang: str = "auto") -> str | None:
             eel.DisplayMessage("I'm listening... / सुन रहा हूं...")
 
             try:
-                recognizer.adjust_for_ambient_noise(source, duration=1.5)
-                if recognizer.energy_threshold < 150:
-                    recognizer.energy_threshold = 150
-                print(f"Energy threshold: {recognizer.energy_threshold}")
+                # Skip calibration if we already have a cached threshold
+                if _cached_energy_threshold is not None:
+                    print(f"Using cached energy threshold: {_cached_energy_threshold}")
+                else:
+                    recognizer.adjust_for_ambient_noise(source, duration=1.2)
+                    if recognizer.energy_threshold < 120:
+                        recognizer.energy_threshold = 120
+                    _cached_energy_threshold = recognizer.energy_threshold
+                    print(f"Energy threshold (calibrated): {recognizer.energy_threshold}")
             except Exception as exc:
                 print(f"Ambient calibration failed: {exc}")
-                recognizer.energy_threshold = 300
+                recognizer.energy_threshold = 200
+                _cached_energy_threshold = 200
 
-            audio = recognizer.listen(source, timeout=10, phrase_time_limit=12)
+            audio = recognizer.listen(source, timeout=7, phrase_time_limit=8)
 
     except sr.WaitTimeoutError:
-        print("No speech detected within 10 seconds")
+        print("No speech detected within 7 seconds")
         eel.DisplayMessage("Didn't catch that — try again?")
         return None
     except Exception as exc:
@@ -375,7 +423,7 @@ def takecommand(lang: str = "auto") -> str | None:
         samples = _np.frombuffer(raw, dtype=_np.int16)
         rms = _np.sqrt(_np.mean(samples.astype(_np.float64) ** 2))
         print(f"Audio RMS: {rms:.1f}")
-        if rms < 30:
+        if rms < 20:
             print("Audio too quiet — rejecting as noise")
             eel.DisplayMessage("Too quiet — please speak louder.")
             return None
@@ -482,46 +530,25 @@ def _match_keyword(query: str, keyword: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-#  Command dispatcher  (exposed to Eel)
+#  Command processor  (internal — does NOT manage UI visibility)
 # ---------------------------------------------------------------------------
 
-@eel.expose
-def takeAllCommands(message: str | None = None) -> None:
-    """The main command loop — voice or typed.
+# Keywords that exit continuous listening mode.
+_CONTINUOUS_EXIT = {
+    "stop", "exit", "quit", "bye", "goodbye", "nothing", "never mind",
+    "turn off", "shut down", "shutdown", "power off",
+    "band kar", "band karo", "bas itna hi", "chup ho ja", "ruk ja",
+    "nikal", "jao", "hato", "bas", "enough", "so ja", "soja",
+    "fir milte hai", "fir milte hain", "bye bye", "tata",
+}
 
-    Parameters
-    ----------
-    message : str or None
-        If ``None``, the microphone is activated.  Otherwise *message* is
-        treated as a typed command and routed the same way.
+
+def _process_query(query: str, message: str | None) -> None:
+    """Process a single recognised / typed command and dispatch to features.
+
+    Does **not** call ``eel.ShowHood()`` — the caller decides when to show
+    the idle UI (typed mode or continuous-mode exit).
     """
-    if message is None:
-        query = takecommand()
-        if not query:
-            # First attempt failed — ask user to try once more
-            speak("Main sun nahi paaya. Ek baar aur bolo.", "hi")
-            eel.senderText("(Listening again...)")
-            query = takecommand()
-        if not query:
-            # Both attempts failed — show hood and exit gracefully
-            speak(
-                "I couldn't hear anything. Please try again or type your command.",
-            )
-            eel.ShowHood()
-            return
-        print(f"Voice: {query}")
-        eel.senderText(query)
-    else:
-        query = message
-        print(f"Message: {query}")
-        eel.senderText(query)
-
-    # Guard against ``query`` being ``None`` or empty *after* the if/else
-    if not query:
-        speak("No command was given.")
-        eel.ShowHood()
-        return
-
     # ---- Detect language BEFORE transliteration overwrites query ----------
     global _last_query_hindi
     _last_query_hindi = any(ord(c) > 127 for c in query)
@@ -530,9 +557,6 @@ def takeAllCommands(message: str | None = None) -> None:
         # ---- Step 0: transliterate Hindi words to English equivalents ----
         q = query.lower()
 
-        # IMPORTANT: longer phrases MUST come before shorter substrings.
-        # Dict iteration order is insertion order (Python 3.7+), so put
-        # multi-word phrases first.
         hindi_to_eng = {
             # -- Multi-word command phrases (match before single words) --
             "गाना बजाओ": "play song", "गाना बजा": "play song",
@@ -570,10 +594,6 @@ def takeAllCommands(message: str | None = None) -> None:
             "गूगल": "google", "फेसबुक": "facebook", "इंस्टाग्राम": "instagram",
             "स्पॉटिफाई": "spotify", "डिस्कॉर्ड": "discord",
         }
-
-        # Detect if the original query was in Hindi (has Devanagari chars).
-        # ``_last_query_hindi`` was already set above and is used by the
-        # module-level ``_say()`` helper to pick Hindi vs English responses.
 
         for hi_word, eng_word in hindi_to_eng.items():
             if hi_word in q:
@@ -615,16 +635,13 @@ def takeAllCommands(message: str | None = None) -> None:
         }
         q = " ".join(w for w in q.split() if w not in _filler_words)
 
-        # Collapse multiple spaces from stripped words and trim
+        # Collapse multiple spaces
         import re as _re
         q = _re.sub(r"\s+", " ", q).strip()
 
         print(f"[CMD] Processing: {q}")
 
-        # From this point onward, use the transliterated ``q`` as the
-        # canonical command text.  The original ``query`` (which may still
-        # contain Devanagari) was already displayed to the user via
-        # ``senderText`` above — all downstream functions expect English.
+        # From this point onward, use transliterated ``q`` as canonical text
         query = q
 
         # ==================================================================
@@ -639,7 +656,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(_match_keyword(query, kw) for kw in search_keywords):
             from backend.feature import searchWeb
             searchWeb(query)
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -652,7 +668,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(_match_keyword(query, kw) for kw in channel_keywords):
             from backend.feature import openYoutuber
             openYoutuber(query)
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -665,7 +680,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(_match_keyword(query, kw) for kw in open_keywords):
             from backend.feature import openCommand
             openCommand(query)
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -679,7 +693,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(_match_keyword(query, kw) for kw in play_keywords):
             from backend.feature import PlayYoutube
             PlayYoutube(query)
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -692,15 +705,12 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(_match_keyword(query, kw) for kw in msg_keywords):
             from backend.feature import findContact, whatsApp, openCommand
 
-            # If the user JUST said "whatsapp" (no call/message/video),
-            # open WhatsApp instead of searching contacts
             is_just_whatsapp = (
                 "whatsapp" in query
                 and not any(w in query for w in ("call", "message", "video", "कॉल", "मैसेज", "bhejo", "karo"))
             )
             if is_just_whatsapp:
                 openCommand("open whatsapp")
-                eel.ShowHood()
                 return
 
             flag = ""
@@ -710,19 +720,13 @@ def takeAllCommands(message: str | None = None) -> None:
                 if any(w in query for w in ("send message", "message", "मैसेज")):
                     flag = "message"
                     if message is None:
-                        # Voice mode — ask user to speak the message body.
-                        # Brief sleep lets TTS release the audio device so
-                        # the next mic open doesn't conflict on Windows.
                         speak("Kya message bhejna hai? / What message to send?")
                         time.sleep(0.5)
                         msg_text = takecommand()
                         if not msg_text:
                             speak("Message cancelled — no speech detected.")
-                            eel.ShowHood()
                             return
                     else:
-                        # Typing mode — extract message from the typed query
-                        # Remove command words and contact name to get the message
                         from backend.helper import remove_words
                         contact_words = name.lower().split() if name and name != query else []
                         cmd_words = ["send", "message", "to", "bhejo", "karo",
@@ -735,7 +739,6 @@ def takeAllCommands(message: str | None = None) -> None:
                             speak(f"Opening WhatsApp for {name}. Please type your message.")
                             msg_text = ""
                     whatsApp(phone, msg_text, flag, name)
-                    eel.ShowHood()
                     return
                 elif "video" in query:
                     flag = "video call"
@@ -743,7 +746,6 @@ def takeAllCommands(message: str | None = None) -> None:
                     flag = "call"
                 whatsApp(phone, query, flag, name)
 
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -753,7 +755,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(kw in query for kw in camera_keywords):
             from backend.feature import openCommand
             openCommand("open camera")
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -763,7 +764,6 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(kw in query for kw in time_keywords):
             now = datetime.now().strftime("%I:%M %p")
             _say(f"Time is {now}", f"समय हुआ है {now}")
-            eel.ShowHood()
             return
 
         # ==================================================================
@@ -773,14 +773,11 @@ def takeAllCommands(message: str | None = None) -> None:
         if any(kw in query for kw in date_keywords):
             today = datetime.now().strftime("%d %B %Y")
             _say(f"Today's date is {today}", f"आज की तारीख है {today}")
-            eel.ShowHood()
             return
 
         # ==================================================================
         #  FALLBACK  -- Web search (Google)
         # ==================================================================
-        # If nothing matched and it's not a known command, search Google
-        # so the user always gets relevant info instead of a dead end.
         from backend.feature import searchWeb
         searchWeb(query)
 
@@ -792,4 +789,101 @@ def takeAllCommands(message: str | None = None) -> None:
         except Exception:
             pass
 
-    eel.ShowHood()
+
+# ---------------------------------------------------------------------------
+#  Command dispatcher  (exposed to Eel)
+# ---------------------------------------------------------------------------
+
+@eel.expose
+def takeAllCommands(message: str | None = None) -> None:
+    """The main command loop — voice or typed.
+
+    Voice mode (``message is None``)
+    --------------------------------
+    Enters **continuous listening** — after each command completes the mic
+    re-opens automatically so you can give multiple commands without
+    pressing the mic button again.
+
+    Say **"stop"**, **"bye"**, **"turn off"**, **"bas"**, **"so ja"**, or
+    **"band kar"** to exit continuous mode.
+
+    Typed mode (``message`` is a string)
+    ------------------------------------
+    Processes the single typed command then shows the idle hood.
+    """
+    if message is None:
+        # ================================================================
+        #  CONTINUOUS VOICE MODE
+        # ================================================================
+        # Jarvis keeps listening until you say "bye", "stop", "turn off",
+        # "band kar", etc.  Silence does NOT exit — only explicit keywords.
+        print("Continuous listening started — say 'bye' or 'stop' to exit")
+
+        _silent_loops = 0  # track consecutive silent cycles
+
+        while True:
+            query = takecommand()
+            if not query:
+                # First attempt failed — one quick retry (no TTS, just visual)
+                eel.senderText("(Listening...)")
+                query = takecommand()
+
+            if not query:
+                # Both attempts failed — stay in the loop silently
+                _silent_loops += 1
+                if _silent_loops == 1:
+                    eel.DisplayMessage("I'm still here... / मैं सुन रहा हूं...")
+                elif _silent_loops % 5 == 0:
+                    eel.DisplayMessage("Listening... / सुन रहा हूं...")
+                continue
+
+            _silent_loops = 0  # reset silence counter
+
+            # -- Exit keyword check: STOP listening ----------------------
+            if _is_exit_command(query):
+                _say(
+                    "Okay, going to sleep. Press the mic or say Jarvis when you need me.",
+                    "Okay, so raha hoon. Jab zaroorat ho mic dabao ya Jarvis bolo.",
+                )
+                eel.ShowHood()
+                return
+
+            print(f"Voice: {query}")
+            eel.senderText(query)
+
+            # Process the command
+            _process_query(query, message)
+
+            # Ready for next command
+            eel.DisplayMessage("Listening... / सुन रहा हूं...")
+    else:
+        # ================================================================
+        #  TYPED MODE  (single command)
+        # ================================================================
+        query = message
+        print(f"Message: {query}")
+        eel.senderText(query)
+
+        if not query:
+            speak("No command was given.")
+            eel.ShowHood()
+            return
+
+        if _is_exit_command(query):
+            speak("Okay, going to sleep.")
+            eel.ShowHood()
+            return
+
+        _process_query(query, message)
+        eel.ShowHood()
+
+
+def _is_exit_command(query: str) -> bool:
+    """Return True if *query* is a request to stop continuous listening."""
+    q = query.lower().strip()
+    if q in _CONTINUOUS_EXIT:
+        return True
+    for kw in _CONTINUOUS_EXIT:
+        if " " in kw and kw in q:
+            return True
+    return False

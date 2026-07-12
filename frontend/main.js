@@ -43,17 +43,19 @@ $(document).ready(function () {
 
   // -----------------------------------------------------------------------
   // 3. Mic button — start voice recognition via Python
-  //    (debounced: ignores clicks within 2s to prevent double-trigger)
+  //    (debounced: ignores clicks while a command is in progress)
   // -----------------------------------------------------------------------
-  var _micBusy = false;
-  var _micDebounceTimer = null;
+  // Declared with window. so controller.js can release the lock from
+  // ShowHood() — otherwise the mic stays blocked until the 15 s timeout.
+  window._micBusy = false;
+  window._micDebounceTimer = null;
 
   function _startListening() {
-    if (_micBusy) {
+    if (window._micBusy) {
       console.log("Mic busy — ignoring duplicate trigger");
       return;
     }
-    _micBusy = true;
+    window._micBusy = true;
 
     try {
       eel.play_assistant_sound()();
@@ -66,9 +68,9 @@ $(document).ready(function () {
 
     // Release the lock after a reasonable timeout (Python calls
     // ShowHood() when done, which restores Oval + hides SiriWave)
-    clearTimeout(_micDebounceTimer);
-    _micDebounceTimer = setTimeout(function () {
-      _micBusy = false;
+    clearTimeout(window._micDebounceTimer);
+    window._micDebounceTimer = setTimeout(function () {
+      window._micBusy = false;
     }, 15000); // 15s — longer than any single voice-command cycle
   }
 
